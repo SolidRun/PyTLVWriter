@@ -4,27 +4,40 @@ import struct
 import binascii
 import smbus
 import time
+import os
+import fcntl
+import argparse
 
 # PAGE_SIZE is the maximum number of bytes per write (smbus block limit)
 PAGE_SIZE = 16
 
 # EEPROM total capacity (in bytes)
 EEPROM_SIZE = 256
-I2C_BUS = None
-EEPROM_ADDR = None
+
+# ioctl code for FS_IOC_SETFLAGS
+FS_IOC_SETFLAGS = 0x40086602
+
+
+# EFI variable configuration
+EFI_VAR_NAME = "ConfigCodeTemporary"
+EFI_VAR_GUID = "20D7915C-5ED8-4455-A55A-315B328A633A"
+EFI_ATTRS = 0x1 | 0x2 | 0x4  # NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS
+
+
+# ANSI color codes
+RED     = "\033[91m"
+YELLOW  = "\033[93m"
+GREEN   = "\033[92m"
+CYAN    = '\033[96m'
+RESET   = "\033[0m"
 
 # Mapping from key names to TLV type codes
 KEYS = {
     # Common Types
     "TLV_CODE_FAMILY": 0x20,
-    # "TLV_CODE_MAC_NUM":         0x21, # Unused by BIOS
-    # "TLV_CODE_MAC_BASE":        0x22, # Unused by BIOS
-    "TLV_CODE_MANUF_DATE": 0x23,
     "TLV_CODE_PLATFORM_NAME": 0x24,
     "TLV_CODE_MANUF_NAME": 0x25,
-    # "TLV_CODE_MANUF_COUNTRY":   0x26, # Unused by BIOS
     "TLV_CODE_VENDOR_NAME": 0x27,
-    "TLV_CODE_NIO_TYPE": 0x28,
 
     # Sys Types
     "TLV_CODE_SYS_NAME": 0x30,
@@ -46,6 +59,7 @@ KEYS = {
     "TLV_CODE_CONFIG_CODE": 0x60,
 }
 
+REVERSE_KEYS = {v: k for k, v in KEYS.items()}
 CRC_CODE = 0xFE
 
 # Custom maximum lengths for specific keys.
@@ -80,7 +94,26 @@ max_lengths = {
     "TLV_CODE_NIO_VERSION": 5
 }
 
-def read_eeprom_data():
+def error(message, code=1):
+    """Print an error message in red and exit."""
+    print(f"{RED}Error: {message}{RESET}", file=sys.stderr)
+    sys.exit(code)
+
+
+def warning(message):
+    """Print a warning message in yellow."""
+    print(f"{YELLOW}Warning: {message}{RESET}", file=sys.stderr)
+
+
+def info(message):
+    """Print an informational message in cyan."""
+    print(f"{CYAN}{message}{RESET}")
+
+def success(message):
+    """Print an success message in green."""
+    print(f"{GREEN}{message}{RESET}")
+
+def read_eeprom(I2C_BUS, EEPROM_ADDR):
     """
     Read the entire EEPROM content and return it as bytes.
     """
@@ -181,12 +214,18 @@ def build_tlv(args):
             except ValueError:
                 sys.exit("Error: mac_size must be an integer")
             val_bytes = struct.pack(">H", num)
-        elif key == "TLV_CODE_NIO_TYPE":
+        # elif key == "TLV_CODE_NIO_TYPE":
+        #     try:
+        #         val_bytes = bytes.fromhex(value)
+        #         print(val_bytes.hex())
+        #     except ValueError:
+        #         sys.exit("Error: NIO Type must be a valid hex number")
+        elif key == "TLV_CODE_CONFIG_CODE":
             try:
-                val_bytes = bytes.fromhex(value)
-                print(val_bytes.hex())
+                write_efi_variable(value)
+                continue
             except ValueError:
-                sys.exit("Error: NIO Type must be a valid hex number")
+                sys.exit("Error: Error writing efi variable")
         else:
             # Default: treat as ASCII string
             val_bytes = value.encode("ascii")
@@ -218,8 +257,40 @@ def build_tlv(args):
 
     return tlv_data
 
+def clear_immutable(path):
+    # open read-only, clear all flags
+    fd = os.open(path, os.O_RDONLY)
+    fcntl.ioctl(fd, FS_IOC_SETFLAGS, struct.pack('I', 0))
+    os.close(fd)
 
-def clear_eeprom():
+
+def write_efi_variable(value_str):
+    """
+    Write or update the CONFIG_CODE EFI variable with the provided string.
+    Automatically creates the variable if it does not exist.
+    """
+    data = value_str.encode('utf-8')
+    var_path = f"/sys/firmware/efi/efivars/{EFI_VAR_NAME}-{EFI_VAR_GUID}"
+    payload = struct.pack('<I', EFI_ATTRS) + data
+
+    if os.path.exists(var_path):
+        clear_immutable(var_path)
+    else:
+        info(f"EFI variable {EFI_VAR_NAME}-{EFI_VAR_GUID} not found; creating new.")
+
+    try:
+        # 'wb' will create the file under efivarfs
+        with open(var_path, 'wb') as f:
+            f.write(payload)
+    except Exception as e:
+        error(f"Unable to write EFI variable: {e}")
+
+    success(f"Config code EFI variable {EFI_VAR_NAME} set successfully\n")
+
+
+
+
+def clear_eeprom(I2C_BUS, EEPROM_ADDR):
     """
     Clear the EEPROM by validate_tlv_data_from_eeproming zeros to every byte.
     """
@@ -235,7 +306,7 @@ def clear_eeprom():
             sys.exit("I2C write error during clear at offset {}: {}".format(offset, e))
         offset += PAGE_SIZE
         time.sleep(0.05)
-    print("EEPROM cleared successfully.")
+    info("EEPROM cleared successfully.\n")
 
 
 
@@ -263,80 +334,78 @@ def write_to_eeprom(data, bin_only=False):
         time.sleep(0.05)
     print("TLV data written successfully to EEPROM.")
 
+class CustomArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser that appends BIOS key-length info to help."""
+    def format_help(self):
+        base = super().format_help()
+        extra = "BIOS supported keys with max lengths:\n"
+        for key in KEYS:
+            max_len = max_lengths.get(key)
+            extra += f"  {key:<32} max length: {max_len}\n"
+        return f"{base}\n{extra}"
 
 def main():
+    if os.geteuid() != 0:
+        error("Root privileges are required to modify EFI variables.")
+
     # Check for the minimum number of arguments.
-    if len(sys.argv) < 4:
-        print("Usage: TLV_write.py <i2c_bus> <eeprom_address> [--yes] [-b] <key> <value> <key> <value> ...")
-        print("\nBIOS supported keys with lenghts: \n")
-        for key in KEYS.keys():
-            code = KEYS[key]
-            max_len = max_lengths.get(key)
-            print(f"\t{key:<32} max length: {max_len}")
-        sys.exit()
+    # if len(sys.argv) < 4:
+    #     print("Usage: TLV_write.py <i2c_bus> <eeprom_address> [--yes] [-b] <key> <value> <key> <value> ...")
+    #     print("\nBIOS supported keys with lenghts: \n")
+    #     for key in KEYS.keys():
+    #         code = KEYS[key]
+    #         max_len = max_lengths.get(key)
+    #         print(f"\t{key:<32} max length: {max_len}")
+    #     sys.exit()
 
-    global I2C_BUS, EEPROM_ADDR
 
-    try:
-        I2C_BUS = int(sys.argv[1])
-    except ValueError:
-        sys.exit("Error: i2c_bus must be an integer")
+    parser = CustomArgumentParser(
+        description='TLVwriter: Manage EEPROM TLV data and CONFIG_CODE EFI variable.'
+    )
+    parser.add_argument('i2c_bus', type=int, help='I2C bus number')
+    parser.add_argument('eeprom_addr', type=lambda x: int(x, 0), help='EEPROM I2C address')
+    parser.add_argument('-r', '--read', action='store_true', help='Read and display EEPROM TLV data')
+    parser.add_argument('-y', '--yes', action='store_true', help='Skip confirmation prompt')
+    parser.add_argument('-b', '--binary', action='store_true', help='Save TLV binary to file only')
+    parser.add_argument('pairs', nargs='*', help='<key> <value> pairs for TLV fields')
 
-    try:
-        # The address can be provided in hex (e.g., '0x50') or decimal.
-        EEPROM_ADDR = int(sys.argv[2], 0)
-    except ValueError:
-        sys.exit("Error: eeprom_address must be an integer")
+    args = parser.parse_args()
 
-    if any(arg.lower() in ("--read", "-r") for arg in sys.argv[3:]):
-        print("Reading EEPROM contents...")
-        raw = read_eeprom_data()
+    if args.read:
+        raw = read_eeprom(args.i2c_bus, args.eeprom_addr)
         parse_and_display(raw)
         return
 
-    # Determine if an auto-confirmation flag is provided.
-    confirm_flag = False
-    bin_only = False
-    kv_offset = 3
+    if not args.pairs or len(args.pairs) % 2 != 0:
+        parser.error('Key/value pairs must be provided in <key> <value> format.')
 
-    if sys.argv[3].lower() in ("--yes", "-y", "--force"):
-        confirm_flag = True
-        kv_offset = 4
-        if sys.argv[4].lower() == "-b":
-            bin_only=True
-            kv_offset = 5
-    elif sys.argv[3].lower() == "-b":
-        bin_only = True
-        kv_offset = 4
+    if not args.yes:
+        warning('This operation will overwrite EEPROM contents. Current data will be lost.')
+        if input('Proceed? [y/N]: ').lower() != 'y':
+            sys.exit('Operation cancelled.')
 
-    # Ensure we have at least one key/value pair.
-    if len(sys.argv) - kv_offset < 2 or ((len(sys.argv) - kv_offset) % 2 != 0):
-
-        sys.exit("Usage: TLV_write.py <i2c_bus> <eeprom_address> [--yes] <key> <value> <key> <value> ...")
-
-    yellow = "\033[93m"     # ANSI code for yellow
-    reset = "\033[0m"       # ANSI code to reset to default
-
-    if not confirm_flag:
-        answer = input(
-            f"{yellow}Warning: This operation will overwrite the EEPROM contents, current data will be "
-            f"lost.\nContinue? [y/N]: {reset}")
-
-        if answer.lower() != 'y':
-            sys.exit("Operation cancelled by user.")
-
-    # Build TLV data using key/value pairs from the arguments.
-    tlv_data = build_tlv(sys.argv[kv_offset:])
-
-    # Ensure TLV data does not exceed the EEPROM capacity.
+    tlv_data = build_tlv(args.pairs)
     if len(tlv_data) > EEPROM_SIZE:
-        sys.exit("Error: Total TLV data length ({0} bytes) exceeds EEPROM capacity ({1} bytes).".format(len(tlv_data),
-                                                                                                        EEPROM_SIZE))
+        error(f'TLV data exceeds EEPROM capacity ({len(tlv_data)} > {EEPROM_SIZE} bytes).')
 
-    # Clear EEPROM before writing new data.
-    clear_eeprom()
-    write_to_eeprom(tlv_data, bin_only )
+    clear_eeprom(args.i2c_bus, args.eeprom_addr)
 
-
+    if args.binary:
+        path = '/tmp/eeprom_tlv.bin'
+        with open(path, 'wb') as f:
+            f.write(tlv_data)
+        info(f'TLV binary saved to {path}')
+    else:
+        bus = smbus.SMBus(args.i2c_bus)
+        offset = 0
+        while offset < len(tlv_data):
+            chunk = list(tlv_data[offset:offset + PAGE_SIZE])
+            try:
+                bus.write_i2c_block_data(args.eeprom_addr, offset, chunk)
+            except Exception as e:
+                error(f'I2C write error at offset {offset}: {e}')
+            offset += PAGE_SIZE
+            time.sleep(0.05)
+        success('TLV data written to EEPROM successfully.\n')
 if __name__ == "__main__":
     main()
