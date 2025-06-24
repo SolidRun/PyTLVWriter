@@ -221,6 +221,16 @@ def build_tlv(args):
         #         print(val_bytes.hex())
         #     except ValueError:
         #         sys.exit("Error: NIO Type must be a valid hex number")
+        elif key == "TLV_CODE_CHS_TYPE":
+            # parse as hex uint8
+            try:
+                num = int(value, 16)
+                if not 0 <= num <= 0xFF:
+                    raise ValueError
+                val_bytes = struct.pack("B", num)
+            except ValueError:
+                sys.exit("Error: CHS_TYPE must be a valid hex uint8 (e.g. 0x23)")
+
         elif key == "TLV_CODE_CONFIG_CODE":
             try:
                 write_efi_variable(value)
