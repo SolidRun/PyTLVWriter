@@ -13,7 +13,7 @@ A command-line Python tool to read and write TLV (Type-Length-Value) data to an 
 * **Writing** the TLV blob into EEPROM in page-sized chunks (default 16 B pages).
 * **Clearing** EEPROM contents before writing new data.
 * **Creating or updating** a `CONFIG_CODE` EFI variable under `/sys/firmware/efi/efivars`.
-* **Colored output** for errors (red), warnings (yellow), and info/success (green).
+* **Colored output** for errors (red), warnings (yellow), info(cyan) and success (green).
 
 This is useful for BIOS/hardware inventory, factory programming, and secure-boot configurations.
 
