@@ -54,6 +54,7 @@ KEYS = {
     # Chassis Types
     "TLV_CODE_CHS_SERIAL_NUMBER": 0x50,
     "TLV_CODE_CHS_VERSION": 0x51,
+    "TLV_CODE_CHS_TYPE" : 0x52,
 
     # Configuration types
     "TLV_CODE_CONFIG_CODE": 0x60,
