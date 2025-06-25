@@ -266,6 +266,14 @@ def build_tlv(args):
     crc_bytes = struct.pack("<I", crc)
     tlv_data = tlv_data[:-4] + crc_bytes
 
+    # ensure we don't overflow the EEPROM
+    if len(tlv_data) > EEPROM_SIZE:
+        sys.exit(f"Error: TLV data exceeds EEPROM capacity ({len(tlv_data)} > {EEPROM_SIZE} bytes).")
+
+    # pad with zeros up to EEPROM_SIZE
+    if len(tlv_data) < EEPROM_SIZE:
+        tlv_data += b'\x00' * (EEPROM_SIZE - len(tlv_data))
+
     return tlv_data
 
 def clear_immutable(path):
@@ -396,8 +404,6 @@ def main():
             sys.exit('Operation cancelled.')
 
     tlv_data = build_tlv(args.pairs)
-    if len(tlv_data) > EEPROM_SIZE:
-        error(f'TLV data exceeds EEPROM capacity ({len(tlv_data)} > {EEPROM_SIZE} bytes).')
 
     clear_eeprom(args.i2c_bus, args.eeprom_addr)
 
