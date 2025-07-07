@@ -405,14 +405,13 @@ def main():
 
     tlv_data = build_tlv(args.pairs)
 
-    clear_eeprom(args.i2c_bus, args.eeprom_addr)
-
     if args.binary:
         path = '/tmp/eeprom_tlv.bin'
         with open(path, 'wb') as f:
             f.write(tlv_data)
         info(f'TLV binary saved to {path}')
     else:
+        clear_eeprom(args.i2c_bus, args.eeprom_addr)
         bus = smbus.SMBus(args.i2c_bus)
         offset = 0
         while offset < len(tlv_data):
