@@ -381,22 +381,21 @@ def main():
     parser = CustomArgumentParser(
         description='TLVwriter: Manage EEPROM TLV data and CONFIG_CODE EFI variable.'
     )
-    parser.add_argument('i2c_bus', type=int, help='I2C bus number')
-    parser.add_argument('eeprom_addr', type=lambda x: int(x, 0), help='EEPROM I2C address')
-    parser.add_argument('-r', '--read', action='store_true', help='Read and display EEPROM TLV data')
-    parser.add_argument('-y', '--yes', action='store_true', help='Skip confirmation prompt')
-    parser.add_argument('-b', '--binary', action='store_true', help='Save TLV binary to file only')
+    parser.add_argument('i2c_bus',          type=int, help='I2C bus number')
+    parser.add_argument('eeprom_addr',      type=lambda x: int(x, 0), help='EEPROM I2C address')
+    parser.add_argument('-r', '--read',     action='store_true', help='Read and display EEPROM TLV data')
+    parser.add_argument('-y', '--yes',      action='store_true', help='Skip confirmation prompt')
+    parser.add_argument('-b', '--binary',   action='store_true', help='Save TLV binary to file only')
     parser.add_argument('pairs', nargs='*', help='<key> <value> pairs for TLV fields')
 
-    args = parser.parse_args()
+    args = parser.parse_intermixed_args()
+
+    i2c_bus = int(args.i2c_bus)
 
     if args.read:
-        raw = read_eeprom(args.i2c_bus, args.eeprom_addr)
+        raw = read_eeprom(i2c_bus, args.eeprom_addr)
         parse_and_display(raw)
         return
-
-    if not args.pairs or len(args.pairs) % 2 != 0:
-        parser.error('Key/value pairs must be provided in <key> <value> format.')
 
     if not args.yes:
         warning('This operation will overwrite EEPROM contents. Current data will be lost.')
@@ -405,14 +404,17 @@ def main():
 
     tlv_data = build_tlv(args.pairs)
 
+    if not args.pairs or len(args.pairs) % 2 != 0:
+        parser.error('Key/value pairs must be provided in <key> <value> format.')
+
     if args.binary:
         path = '/tmp/eeprom_tlv.bin'
         with open(path, 'wb') as f:
             f.write(tlv_data)
         info(f'TLV binary saved to {path}')
     else:
-        clear_eeprom(args.i2c_bus, args.eeprom_addr)
-        bus = smbus.SMBus(args.i2c_bus)
+        clear_eeprom(i2c_bus, args.eeprom_addr)
+        bus = smbus.SMBus(i2c_bus)
         offset = 0
         while offset < len(tlv_data):
             chunk = list(tlv_data[offset:offset + PAGE_SIZE])
