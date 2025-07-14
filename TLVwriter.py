@@ -88,6 +88,7 @@ max_lengths = {
     # Chassis Types
     "TLV_CODE_CHS_SERIAL_NUMBER": 24,
     "TLV_CODE_CHS_VERSION": 5,
+    "TLV_CODE_CHS_TYPE": 1,
 
     # NIO Types
     "TLV_CODE_NIO_NAME": 20,
@@ -110,9 +111,11 @@ def info(message):
     """Print an informational message in cyan."""
     print(f"{CYAN}{message}{RESET}")
 
+
 def success(message):
     """Print an success message in green."""
     print(f"{GREEN}{message}{RESET}")
+
 
 def read_eeprom(I2C_BUS, EEPROM_ADDR):
     """
@@ -129,6 +132,7 @@ def read_eeprom(I2C_BUS, EEPROM_ADDR):
         data.extend(block)
         time.sleep(0.05)
     return bytes(data)
+
 
 def parse_and_display(raw):
     """
@@ -168,6 +172,7 @@ def parse_and_display(raw):
 
         idx += 2 + l
 
+
 def parse_mac(mac_str):
     """
     Parse a MAC address provided either in the format xx:xx:xx:xx:xx:xx or
@@ -188,7 +193,6 @@ def parse_mac(mac_str):
             return bytes(int(mac_str[i:i + 2], 16) for i in range(0, 12, 2))
         except Exception as e:
             sys.exit("Error: Invalid MAC address format: " + str(e))
-
 
 
 def build_tlv(args):
@@ -307,8 +311,6 @@ def write_efi_variable(value_str):
     success(f"Config code EFI variable {EFI_VAR_NAME} set successfully\n")
 
 
-
-
 def clear_eeprom(I2C_BUS, EEPROM_ADDR):
     """
     Clear the EEPROM by validate_tlv_data_from_eeproming zeros to every byte.
@@ -326,7 +328,6 @@ def clear_eeprom(I2C_BUS, EEPROM_ADDR):
         offset += PAGE_SIZE
         time.sleep(0.05)
     info("EEPROM cleared successfully.\n")
-
 
 
 def write_to_eeprom(data, bin_only=False):
@@ -360,23 +361,12 @@ class CustomArgumentParser(argparse.ArgumentParser):
         extra = "BIOS supported keys with max lengths:\n"
         for key in KEYS:
             max_len = max_lengths.get(key)
-            extra += f"  {key:<32} max length: {max_len}\n"
+            extra += f"  {key:<32} max length: {max_len} bytes\n"
         return f"{base}\n{extra}"
 
 def main():
     if os.geteuid() != 0:
         error("Root privileges are required to modify EFI variables.")
-
-    # Check for the minimum number of arguments.
-    # if len(sys.argv) < 4:
-    #     print("Usage: TLV_write.py <i2c_bus> <eeprom_address> [--yes] [-b] <key> <value> <key> <value> ...")
-    #     print("\nBIOS supported keys with lenghts: \n")
-    #     for key in KEYS.keys():
-    #         code = KEYS[key]
-    #         max_len = max_lengths.get(key)
-    #         print(f"\t{key:<32} max length: {max_len}")
-    #     sys.exit()
-
 
     parser = CustomArgumentParser(
         description='TLVwriter: Manage EEPROM TLV data and CONFIG_CODE EFI variable.'
