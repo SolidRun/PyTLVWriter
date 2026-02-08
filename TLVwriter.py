@@ -2,33 +2,29 @@
 import sys
 import struct
 import binascii
-import smbus
 import time
 import os
 import fcntl
 import argparse
 
-# PAGE_SIZE is the maximum number of bytes per write (smbus block limit)
-PAGE_SIZE = 16
-
-# EEPROM total capacity (in bytes)
-EEPROM_SIZE = 256
+# -----------------------------
+# Defaults
+# -----------------------------
+DEFAULT_PAGE_SIZE = 16
 
 # ioctl code for FS_IOC_SETFLAGS
 FS_IOC_SETFLAGS = 0x40086602
-
 
 # EFI variable configuration
 EFI_VAR_NAME = "ConfigCodeTemporary"
 EFI_VAR_GUID = "20D7915C-5ED8-4455-A55A-315B328A633A"
 EFI_ATTRS = 0x1 | 0x2 | 0x4  # NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS
 
-
 # ANSI color codes
 RED     = "\033[91m"
 YELLOW  = "\033[93m"
 GREEN   = "\033[92m"
-CYAN    = '\033[96m'
+CYAN    = "\033[96m"
 RESET   = "\033[0m"
 
 # Mapping from key names to TLV type codes
@@ -54,7 +50,7 @@ KEYS = {
     # Chassis Types
     "TLV_CODE_CHS_SERIAL_NUMBER": 0x50,
     "TLV_CODE_CHS_VERSION": 0x51,
-    "TLV_CODE_CHS_TYPE" : 0x52,
+    "TLV_CODE_CHS_TYPE": 0x52,
 
     # Configuration types
     "TLV_CODE_CONFIG_CODE": 0x60,
@@ -63,85 +59,168 @@ KEYS = {
 REVERSE_KEYS = {v: k for k, v in KEYS.items()}
 CRC_CODE = 0xFE
 
-# Custom maximum lengths for specific keys.
 max_lengths = {
-    # Common Types
     "TLV_CODE_FAMILY": 20,
-    "TLV_CODE_MAC_NUM": 2,
-    "TLV_CODE_MAC_BASE": 6,
-    "TLV_CODE_MANUF_DATE": 10,
-    "TLV_CODE_PLATFORM_NAME": 20,
+    "TLV_CODE_PLATFORM_NAME": 24,
     "TLV_CODE_MANUF_NAME": 20,
-    "TLV_CODE_MANUF_COUNTRY": 2,
     "TLV_CODE_VENDOR_NAME": 20,
     "TLV_CODE_CONFIG_CODE": 200,
-    "TLV_CODE_NIO_TYPE": 8,
 
-
-    # Sys Types
     "TLV_CODE_SYS_NAME": 20,
     "TLV_CODE_SYS_SKU": 20,
     "TLV_CODE_SYS_SERIAL_NUMBER": 24,
     "TLV_CODE_SYS_VERSION": 5,
     "TLV_CODE_SYS_UUID": 36,
 
-    # Chassis Types
     "TLV_CODE_CHS_SERIAL_NUMBER": 24,
     "TLV_CODE_CHS_VERSION": 5,
     "TLV_CODE_CHS_TYPE": 1,
 
-    # NIO Types
     "TLV_CODE_NIO_NAME": 20,
     "TLV_CODE_NIO_SERIAL_NUMBER": 24,
-    "TLV_CODE_NIO_VERSION": 5
+    "TLV_CODE_NIO_VERSION": 5,
 }
 
+# -----------------------------
+# Logging helpers
+# -----------------------------
 def error(message, code=1):
-    """Print an error message in red and exit."""
     print(f"{RED}Error: {message}{RESET}", file=sys.stderr)
     sys.exit(code)
 
-
 def warning(message):
-    """Print a warning message in yellow."""
     print(f"{YELLOW}Warning: {message}{RESET}", file=sys.stderr)
 
-
 def info(message):
-    """Print an informational message in cyan."""
     print(f"{CYAN}{message}{RESET}")
 
-
 def success(message):
-    """Print an success message in green."""
     print(f"{GREEN}{message}{RESET}")
 
+def addr_space_max_bytes(addr_width: int) -> int:
+    if addr_width == 8:
+        return 256
+    if addr_width == 16:
+        return 65536
+    error(f"Unsupported addr_width: {addr_width}")
 
-def read_eeprom(I2C_BUS, EEPROM_ADDR):
+# -----------------------------
+# EEPROM I/O (smbus for 8-bit, smbus2 for 16-bit)
+# -----------------------------
+class EepromIO:
     """
-    Read the entire EEPROM content and return it as bytes.
+    EEPROM IO abstraction:
+      - addr_width=8  -> uses smbus (block read/write with command byte)
+      - addr_width=16 -> uses smbus2 + i2c_msg (combined write addr_hi/lo then read)
+    Enforces max address space statically based on addr_width.
     """
-    bus = smbus.SMBus(I2C_BUS)
-    data = []
-    for offset in range(0, EEPROM_SIZE, PAGE_SIZE):
-        chunk_len = min(PAGE_SIZE, EEPROM_SIZE - offset)
-        try:
-            block = bus.read_i2c_block_data(EEPROM_ADDR, offset, chunk_len)
-        except Exception as e:
-            sys.exit(f"I2C read error at offset {offset}: {e}")
-        data.extend(block)
-        time.sleep(0.05)
-    return bytes(data)
 
+    def __init__(self, i2c_bus: int, dev_addr: int, addr_width: int, page_size: int):
+        self.i2c_bus = i2c_bus
+        self.dev_addr = dev_addr
+        self.addr_width = addr_width
+        self.page_size = page_size
+        self.max_bytes = addr_space_max_bytes(addr_width)
 
-def parse_and_display(raw):
-    """
-    Parse raw TLV data and print each entry in human-readable form.
-    """
-    # Minimum header length: 8 sig bytes +1 version +2 length =11 bytes
+        self._bus = None
+        self._mode = None  # "smbus" or "smbus2"
+        self._i2c_msg = None
+
+        if addr_width == 8:
+            try:
+                import smbus
+            except Exception as e:
+                error(f"Python smbus is required for 8-bit addressing mode but import failed: {e}")
+            self._bus = smbus.SMBus(i2c_bus)
+            self._mode = "smbus"
+        else:
+            try:
+                from smbus2 import SMBus, i2c_msg
+            except Exception as e:
+                error(f"16-bit EEPROM addressing requires smbus2, but import failed: {e}")
+
+            self._bus = SMBus(i2c_bus)
+            self._mode = "smbus2"
+            self._i2c_msg = i2c_msg
+
+    def close(self):
+        if self._bus is not None:
+            try:
+                self._bus.close()
+            except Exception:
+                pass
+            self._bus = None
+
+    def _bounds_check(self, offset: int, length: int):
+        if offset < 0 or length < 0:
+            error("Negative offset/length not allowed")
+        if offset + length > self.max_bytes:
+            error(f"Access out of range: offset {offset} + len {length} exceeds max {self.max_bytes} for addr_width={self.addr_width}")
+
+    def read(self, offset: int, length: int):
+        self._bounds_check(offset, length)
+
+        if self.addr_width == 8:
+            # SMBus block read: command byte is the offset
+            return self._bus.read_i2c_block_data(self.dev_addr, offset & 0xFF, length)
+
+        # 16-bit: combined write(address_hi,address_lo) then read(length)
+        hi = (offset >> 8) & 0xFF
+        lo = offset & 0xFF
+        w = self._i2c_msg.write(self.dev_addr, [hi, lo])
+        r = self._i2c_msg.read(self.dev_addr, length)
+        self._bus.i2c_rdwr(w, r)
+        return list(r)
+
+    def write(self, offset: int, data_bytes: bytes):
+        self._bounds_check(offset, len(data_bytes))
+
+        if self.addr_width == 8:
+            # SMBus block write: command byte is the offset
+            self._bus.write_i2c_block_data(self.dev_addr, offset & 0xFF, list(data_bytes))
+            return
+
+        # 16-bit: single write with [hi, lo, data...]
+        hi = (offset >> 8) & 0xFF
+        lo = offset & 0xFF
+        msg = self._i2c_msg.write(self.dev_addr, [hi, lo] + list(data_bytes))
+        self._bus.i2c_rdwr(msg)
+
+    def eeprom_write_cycle_poll(self, offset: int, timeout_s: float = 1.0):
+        """
+        Optional ACK polling after a write cycle.
+        This is best-effort; not all adapters behave identically.
+        """
+        end = time.time() + timeout_s
+
+        if self.addr_width == 8:
+            while time.time() < end:
+                try:
+                    _ = self._bus.read_byte_data(self.dev_addr, offset & 0xFF)
+                    return
+                except Exception:
+                    time.sleep(0.005)
+            return
+
+        # 16-bit: attempt a small "address pointer set" write; retry until it works
+        hi = (offset >> 8) & 0xFF
+        lo = offset & 0xFF
+        while time.time() < end:
+            try:
+                msg = self._i2c_msg.write(self.dev_addr, [hi, lo])
+                self._bus.i2c_rdwr(msg)
+                return
+            except Exception:
+                time.sleep(0.005)
+
+# -----------------------------
+# TLV parsing / building
+# -----------------------------
+def parse_and_display(raw: bytes):
     if len(raw) < 11:
         print("Data too short to contain TLV header.")
         return
+
     sig = raw[:8].rstrip(b'\x00')
     version = raw[8]
     payload_len = struct.unpack('<H', raw[9:11])[0]
@@ -154,13 +233,17 @@ def parse_and_display(raw):
         if idx + 2 > len(payload):
             print("Incomplete TLV entry at end of payload.")
             break
+
         t = payload[idx]
         l = payload[idx+1]
         v = payload[idx+2:idx+2+l]
 
         if t == CRC_CODE:
-            crc_val = struct.unpack('<I', v)[0]
-            print(f"CRC: 0x{crc_val:08X}")
+            if len(v) >= 4:
+                crc_val = struct.unpack('<I', v[:4])[0]
+                print(f"CRC: 0x{crc_val:08X}")
+            else:
+                print("CRC entry malformed.")
             break
 
         name = REVERSE_KEYS.get(t, f"Unknown(0x{t:02X})")
@@ -172,126 +255,12 @@ def parse_and_display(raw):
 
         idx += 2 + l
 
-
-def parse_mac(mac_str):
-    """
-    Parse a MAC address provided either in the format xx:xx:xx:xx:xx:xx or
-    as a 12-character hexadecimal string (e.g., aabbccddeeff) and return the 6-byte binary representation.
-    """
-    if ':' in mac_str:
-        parts = mac_str.split(':')
-        if len(parts) != 6:
-            sys.exit("Error: MAC address must have 6 colon-separated parts.")
-        try:
-            return bytes(int(x, 16) for x in parts)
-        except Exception as e:
-            sys.exit("Error: Invalid MAC address format: " + str(e))
-    else:
-        if len(mac_str) != 12:
-            sys.exit("Error: MAC address must be 12 hexadecimal characters when not using ':' separators.")
-        try:
-            return bytes(int(mac_str[i:i + 2], 16) for i in range(0, 12, 2))
-        except Exception as e:
-            sys.exit("Error: Invalid MAC address format: " + str(e))
-
-
-def build_tlv(args):
-    if len(args) == 0 or len(args) % 2 != 0:
-        sys.exit("Usage: TLV_write.py <i2c_bus> <eeprom_address> [--yes] <key> <value> ...")
-
-    payload = bytearray()
-
-    for i in range(0, len(args), 2):
-        # key = args[i].lower()
-        key = args[i]
-        value = args[i + 1]
-        if key not in KEYS:
-            sys.exit(f"Error: Unknown key: {key}")
-        code = KEYS[key]
-
-        if key == "mac_base":
-            val_bytes = parse_mac(value)
-        elif key == "mac_size":
-            try:
-                num = int(value)
-                if num > 99:
-                    sys.exit("Error: mac_size must be less than 99")
-            except ValueError:
-                sys.exit("Error: mac_size must be an integer")
-            val_bytes = struct.pack(">H", num)
-        # elif key == "TLV_CODE_NIO_TYPE":
-        #     try:
-        #         val_bytes = bytes.fromhex(value)
-        #         print(val_bytes.hex())
-        #     except ValueError:
-        #         sys.exit("Error: NIO Type must be a valid hex number")
-        elif key == "TLV_CODE_CHS_TYPE":
-            # parse as hex uint8
-            try:
-                num = int(value, 16)
-                if not 0 <= num <= 0xFF:
-                    raise ValueError
-                val_bytes = struct.pack("B", num)
-            except ValueError:
-                sys.exit("Error: CHS_TYPE must be a valid hex uint8 (e.g. 0x23)")
-
-        elif key == "TLV_CODE_CONFIG_CODE":
-            try:
-                write_efi_variable(value)
-                continue
-            except ValueError:
-                sys.exit("Error: Error writing efi variable")
-        else:
-            # Default: treat as ASCII string
-            val_bytes = value.encode("ascii")
-
-        # Enforce custom maximum length if defined for the key.
-        if key in max_lengths and len(val_bytes) > max_lengths[key]:
-            sys.exit(f"Error: Value for key '{key}' is too long (max {max_lengths[key]} bytes).")
-
-        # Append field: type, length, value.
-        payload.extend(struct.pack("BB", code, len(val_bytes)))
-        payload.extend(val_bytes)
-
-    # Append CRC placeholder and header construction
-    payload.extend(struct.pack("BB", CRC_CODE, 4))
-    payload.extend(b'\x00\x00\x00\x00')
-
-    header = bytearray()
-    sig = b"TlvInfo" + b"\0" * (8 - len("TlvInfo"))
-    header.extend(sig)
-    header.append(1)  # version
-    payload_length = len(payload)
-    header.extend(struct.pack("<H", payload_length))
-
-    tlv_data = header + payload
-    crc_input = tlv_data[:-4]
-    crc = binascii.crc32(crc_input) & 0xffffffff
-    crc_bytes = struct.pack("<I", crc)
-    tlv_data = tlv_data[:-4] + crc_bytes
-
-    # ensure we don't overflow the EEPROM
-    if len(tlv_data) > EEPROM_SIZE:
-        sys.exit(f"Error: TLV data exceeds EEPROM capacity ({len(tlv_data)} > {EEPROM_SIZE} bytes).")
-
-    # pad with zeros up to EEPROM_SIZE
-    if len(tlv_data) < EEPROM_SIZE:
-        tlv_data += b'\x00' * (EEPROM_SIZE - len(tlv_data))
-
-    return tlv_data
-
 def clear_immutable(path):
-    # open read-only, clear all flags
     fd = os.open(path, os.O_RDONLY)
     fcntl.ioctl(fd, FS_IOC_SETFLAGS, struct.pack('I', 0))
     os.close(fd)
 
-
-def write_efi_variable(value_str):
-    """
-    Write or update the CONFIG_CODE EFI variable with the provided string.
-    Automatically creates the variable if it does not exist.
-    """
+def write_efi_variable(value_str: str):
     data = value_str.encode('utf-8')
     var_path = f"/sys/firmware/efi/efivars/{EFI_VAR_NAME}-{EFI_VAR_GUID}"
     payload = struct.pack('<I', EFI_ATTRS) + data
@@ -302,7 +271,6 @@ def write_efi_variable(value_str):
         info(f"EFI variable {EFI_VAR_NAME}-{EFI_VAR_GUID} not found; creating new.")
 
     try:
-        # 'wb' will create the file under efivarfs
         with open(var_path, 'wb') as f:
             f.write(payload)
     except Exception as e:
@@ -310,52 +278,117 @@ def write_efi_variable(value_str):
 
     success(f"Config code EFI variable {EFI_VAR_NAME} set successfully\n")
 
+def build_tlv(pairs) -> bytes:
+    if len(pairs) == 0 or len(pairs) % 2 != 0:
+        error("Key/value pairs must be provided in <key> <value> format.")
 
-def clear_eeprom(I2C_BUS, EEPROM_ADDR):
-    """
-    Clear the EEPROM by validate_tlv_data_from_eeproming zeros to every byte.
-    """
-    bus = smbus.SMBus(I2C_BUS)
-    total_length = EEPROM_SIZE
+    payload = bytearray()
+
+    for i in range(0, len(pairs), 2):
+        key = pairs[i]
+        value = pairs[i + 1]
+
+        if key not in KEYS:
+            error(f"Unknown key: {key}")
+        code = KEYS[key]
+
+        if key == "TLV_CODE_CHS_TYPE":
+            try:
+                num = int(value, 16)
+                if not 0 <= num <= 0xFF:
+                    raise ValueError
+                val_bytes = struct.pack("B", num)
+            except ValueError:
+                error("CHS_TYPE must be a valid hex uint8 (e.g. 0x23)")
+
+        elif key == "TLV_CODE_CONFIG_CODE":
+            write_efi_variable(value)
+            continue
+
+        else:
+            try:
+                val_bytes = value.encode("ascii")
+            except Exception as e:
+                error(f"Value for {key} must be ASCII: {e}")
+
+        if key in max_lengths and len(val_bytes) > max_lengths[key]:
+            error(f"Value for key '{key}' is too long (max {max_lengths[key]} bytes).")
+
+        payload.extend(struct.pack("BB", code, len(val_bytes)))
+        payload.extend(val_bytes)
+
+    # CRC placeholder entry
+    payload.extend(struct.pack("BB", CRC_CODE, 4))
+    payload.extend(b'\x00\x00\x00\x00')
+
+    header = bytearray()
+    sig = b"TlvInfo" + b"\0" * (8 - len("TlvInfo"))
+    header.extend(sig)
+    header.append(1)  # version
+    header.extend(struct.pack("<H", len(payload)))
+
+    tlv_data = header + payload
+
+    # Fill CRC
+    crc = binascii.crc32(tlv_data[:-4]) & 0xFFFFFFFF
+    tlv_data = tlv_data[:-4] + struct.pack("<I", crc)
+
+    return bytes(tlv_data)
+
+# -----------------------------
+# EEPROM ops (only TLV-length bytes)
+# -----------------------------
+def clear_region(eio: EepromIO, length: int, page_size: int, poll_write: bool):
     offset = 0
-    while offset < total_length:
-        chunk_length = min(PAGE_SIZE, total_length - offset)
-        blank = [0x00] * chunk_length
-        try:
-            bus.write_i2c_block_data(EEPROM_ADDR, offset, blank)
-        except Exception as e:
-            sys.exit("I2C write error during clear at offset {}: {}".format(offset, e))
-        offset += PAGE_SIZE
-        time.sleep(0.05)
-    info("EEPROM cleared successfully.\n")
+    while offset < length:
+        chunk_len = min(page_size, length - offset)
+        blank = bytes([0x00] * chunk_len)
+        eio.write(offset, blank)
+        if poll_write:
+            eio.eeprom_write_cycle_poll(offset)
+        offset += chunk_len
+        time.sleep(0.01)
 
-
-def write_to_eeprom(data, bin_only=False):
-    if bin_only:
-        padded = data + bytes([0x00] * (EEPROM_SIZE - len(data)))
-        bin_path=f"/tmp/eeprom_tlv.bin"
-        with open(bin_path, "wb") as f:
-            f.write(padded)
-        print(f"saved TLV binary to {bin_path}")
-        return
-
-    bus = smbus.SMBus(I2C_BUS)
-    total_length = len(data)
+def write_region(eio: EepromIO, blob: bytes, page_size: int, poll_write: bool):
     offset = 0
+    total = len(blob)
+    while offset < total:
+        chunk = blob[offset:offset + page_size]
+        eio.write(offset, chunk)
+        if poll_write:
+            eio.eeprom_write_cycle_poll(offset)
+        offset += len(chunk)
+        time.sleep(0.01)
 
-    # Write data in PAGE_SIZE chunks.
-    while offset < total_length:
-        chunk = list(data[offset:offset + PAGE_SIZE])
-        try:
-            bus.write_i2c_block_data(EEPROM_ADDR, offset, chunk)
-        except Exception as e:
-            sys.exit("I2C write error at offset {}: {}".format(offset, e))
-        offset += PAGE_SIZE
-        time.sleep(0.05)
-    print("TLV data written successfully to EEPROM.")
+def read_tlv_auto(eio: EepromIO, page_size: int) -> bytes:
+    """
+    Read just enough bytes to parse the TLV:
+      - read 11 bytes header
+      - parse payload_len
+      - read (11 + payload_len) bytes total
+    """
+    hdr = bytes(eio.read(0, 11))
+    if len(hdr) < 11:
+        return hdr
 
+    payload_len = struct.unpack('<H', hdr[9:11])[0]
+    total = 11 + payload_len
+
+    if total > eio.max_bytes:
+        error(f"TLV claims total length {total}, exceeds max address space {eio.max_bytes}")
+
+    out = bytearray(hdr)
+    offset = 11
+    while offset < total:
+        n = min(page_size, total - offset)
+        out.extend(eio.read(offset, n))
+        offset += n
+    return bytes(out)
+
+# -----------------------------
+# CLI
+# -----------------------------
 class CustomArgumentParser(argparse.ArgumentParser):
-    """ArgumentParser that appends BIOS key-length info to help."""
     def format_help(self):
         base = super().format_help()
         extra = "BIOS supported keys with max lengths:\n"
@@ -366,54 +399,71 @@ class CustomArgumentParser(argparse.ArgumentParser):
 
 def main():
     if os.geteuid() != 0:
-        error("Root privileges are required to modify EFI variables.")
+        error("Root privileges are required to modify EFI variables and access /dev/i2c-*.")
 
     parser = CustomArgumentParser(
-        description='TLVwriter: Manage EEPROM TLV data and CONFIG_CODE EFI variable.'
+        description="TLVwriter: Write TLV to EEPROM and CONFIG_CODE EFI variable (clears only TLV length bytes)."
     )
-    parser.add_argument('i2c_bus',          type=int, help='I2C bus number')
-    parser.add_argument('eeprom_addr',      type=lambda x: int(x, 0), help='EEPROM I2C address')
-    parser.add_argument('-r', '--read',     action='store_true', help='Read and display EEPROM TLV data')
-    parser.add_argument('-y', '--yes',      action='store_true', help='Skip confirmation prompt')
-    parser.add_argument('-b', '--binary',   action='store_true', help='Save TLV binary to file only')
+    parser.add_argument('i2c_bus',     type=int, help='I2C bus number (e.g. 7)')
+    parser.add_argument('eeprom_addr', type=lambda x: int(x, 0), help='EEPROM I2C address (e.g. 0x51)')
+
+    parser.add_argument('-r', '--read',   action='store_true', help='Read and display EEPROM TLV data (auto-length)')
+    parser.add_argument('-y', '--yes',    action='store_true', help='Skip confirmation prompt')
+    parser.add_argument('-b', '--binary', action='store_true', help='Save TLV binary to file only')
+
+    parser.add_argument('--addr-width',   type=int, choices=[8, 16], default=8,
+                        help='EEPROM internal address width in bits (8 or 16)')
+    parser.add_argument('--page-size', dest='page_size', type=int, default=DEFAULT_PAGE_SIZE,
+                        help='Max bytes per page write (device dependent)')
+    parser.add_argument('--poll-write', action='store_true',
+                        help='ACK-poll after each write page (more reliable for EEPROMs)')
     parser.add_argument('pairs', nargs='*', help='<key> <value> pairs for TLV fields')
 
-    args = parser.parse_intermixed_args()
-
-    i2c_bus = int(args.i2c_bus)
-
-    if args.read:
-        raw = read_eeprom(i2c_bus, args.eeprom_addr)
-        parse_and_display(raw)
-        return
-
-    if not args.yes:
-        warning('This operation will overwrite EEPROM contents. Current data will be lost.')
-        if input('Proceed? [y/N]: ').lower() != 'y':
-            sys.exit('Operation cancelled.')
-
-    tlv_data = build_tlv(args.pairs)
-
-    if not args.pairs or len(args.pairs) % 2 != 0:
-        parser.error('Key/value pairs must be provided in <key> <value> format.')
-
-    if args.binary:
-        path = '/tmp/eeprom_tlv.bin'
-        with open(path, 'wb') as f:
-            f.write(tlv_data)
-        info(f'TLV binary saved to {path}')
+    if hasattr(parser, "parse_intermixed_args"):
+        args = parser.parse_intermixed_args()
     else:
-        clear_eeprom(i2c_bus, args.eeprom_addr)
-        bus = smbus.SMBus(i2c_bus)
-        offset = 0
-        while offset < len(tlv_data):
-            chunk = list(tlv_data[offset:offset + PAGE_SIZE])
-            try:
-                bus.write_i2c_block_data(args.eeprom_addr, offset, chunk)
-            except Exception as e:
-                error(f'I2C write error at offset {offset}: {e}')
-            offset += PAGE_SIZE
-            time.sleep(0.05)
-        success('TLV data written to EEPROM successfully.\n')
+        args = parser.parse_args()
+
+    eio = EepromIO(
+        i2c_bus=args.i2c_bus,
+        dev_addr=args.eeprom_addr,
+        addr_width=args.addr_width,
+        page_size=args.page_size
+    )
+
+    try:
+        if args.read:
+            raw = read_tlv_auto(eio, args.page_size)
+            parse_and_display(raw)
+            return
+
+        if not args.pairs or (len(args.pairs) % 2) != 0:
+            parser.error("Key/value pairs must be provided in <key> <value> format.")
+
+        if not args.yes:
+            warning("This operation will overwrite TLV region in EEPROM (only TLV length bytes will be cleared/written).")
+            if input("Proceed? [y/N]: ").lower() != 'y':
+                sys.exit("Operation cancelled.")
+
+        tlv_data = build_tlv(args.pairs)
+
+        if len(tlv_data) > eio.max_bytes:
+            error(f"TLV blob length {len(tlv_data)} exceeds max {eio.max_bytes} for addr_width={args.addr_width}")
+
+        if args.binary:
+            path = "/tmp/eeprom_tlv.bin"
+            with open(path, "wb") as f:
+                f.write(tlv_data)
+            info(f"TLV binary saved to {path}")
+            return
+
+        clear_region(eio, len(tlv_data), args.page_size, args.poll_write)
+        write_region(eio, tlv_data, args.page_size, args.poll_write)
+
+        success(f"TLV data written successfully ({len(tlv_data)} bytes). Max space for addr-width={args.addr_width} is {eio.max_bytes} bytes.\n")
+
+    finally:
+        eio.close()
+
 if __name__ == "__main__":
     main()
