@@ -12,6 +12,7 @@ A command-line Python tool to read and write TLV (Type-Length-Value) data to an 
 * **Building** a TLV binary blob from `<key> <value>` pairs.
 * **Writing** the TLV blob into EEPROM in page-sized chunks (default 16 B pages).
 * **Clearing** EEPROM contents before writing new data.
+* **Refusing to overwrite SPD EEPROMs** detected from their JEDEC header and checksum/CRC.
 * **Creating or updating** a `CONFIG_CODE` EFI variable under `/sys/firmware/efi/efivars`.
 
 ---
@@ -126,6 +127,7 @@ sudo python3 TLVwriter.py <i2c_bus> <eeprom_addr> [options] <key1> <val1> [<key2
 * `-y`, `--yes`     : Skip confirmation prompt before overwrite.
 * `-b`, `--binary`  : Write TLV blob to `/tmp/eeprom_tlv.bin` instead of EEPROM.
 * `-v`, `--verify`  : Read back the EEPROM after writing and verify it byte-for-byte.
+* `--force-spd`     : Override SPD protection and allow the write (**dangerous**).
 
 **Examples**:
 

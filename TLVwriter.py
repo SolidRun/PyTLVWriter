@@ -360,6 +360,85 @@ def write_region(eio: EepromIO, blob: bytes, page_size: int, poll_write: bool):
         offset += len(chunk)
         time.sleep(0.01)
 
+SPD_MEMORY_TYPES = {
+    0x01: "FPM DRAM",
+    0x02: "EDO DRAM",
+    0x03: "Pipelined Nibble DRAM",
+    0x04: "SDR SDRAM",
+    0x05: "ROM",
+    0x06: "DDR SGRAM",
+    0x07: "DDR SDRAM",
+    0x08: "DDR2 SDRAM",
+    0x0B: "DDR3 SDRAM",
+    0x0C: "DDR4 SDRAM",
+    0x0F: "LPDDR3 SDRAM",
+    0x10: "LPDDR4 SDRAM",
+    0x11: "LPDDR4X SDRAM",
+    0x12: "DDR5 SDRAM",
+    0x13: "LPDDR5 SDRAM",
+    0x14: "LPDDR5X SDRAM",
+}
+
+def spd_crc16(data: bytes) -> int:
+    """JEDEC SPD CRC-16 (polynomial 0x1021, initial value 0)."""
+    crc = 0
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+    return crc
+
+def detect_spd(eio: EepromIO) -> str:
+    """Return an SPD description when the target strongly resembles DIMM SPD."""
+    raw = bytearray()
+    try:
+        # SMBus block transactions are commonly limited to 32 bytes. Reading
+        # 128 bytes covers the base identification and checksum/CRC fields.
+        for offset in range(0, 128, 16):
+            raw.extend(eio.read(offset, 16))
+    except Exception:
+        return ""
+
+    if len(raw) < 128 or all(b == 0x00 for b in raw) or all(b == 0xFF for b in raw):
+        return ""
+
+    memory_type = raw[2]
+    description = SPD_MEMORY_TYPES.get(memory_type)
+    if description is None:
+        return ""
+
+    at_spd_address = 0x50 <= eio.dev_addr <= 0x57
+    revision_valid = raw[1] not in (0x00, 0xFF) and (raw[1] >> 4) <= 2
+    module_type_valid = raw[3] not in (0x00, 0xFF)
+
+    if memory_type <= 0x08:
+        # Legacy SPD formats use an 8-bit checksum at byte 63.
+        integrity_valid = (sum(raw[:64]) & 0xFF) == 0
+        header_valid = raw[0] not in (0x00, 0xFF)
+    else:
+        stored_crc = raw[126] | (raw[127] << 8)
+        # DDR3 may cover 117 or 126 bytes depending on byte 0 bit 7. Accepting
+        # either also tolerates readers/dumps that normalize that flag.
+        crc_lengths = (117, 126) if memory_type in (0x0B, 0x0F) else (126,)
+        integrity_valid = stored_crc not in (0x0000, 0xFFFF) and any(
+            spd_crc16(raw[:length]) == stored_crc for length in crc_lengths
+        )
+
+        if memory_type in (0x12, 0x13, 0x14):
+            header_valid = (raw[0] & 0x70) == 0x30
+        else:
+            bytes_used = raw[0] & 0x0F
+            total_bytes = (raw[0] >> 4) & 0x07
+            header_valid = 1 <= bytes_used <= 4 and 1 <= total_bytes <= 4
+
+    # A valid checksum/CRC plus a JEDEC memory type is a strong match even if
+    # the device is mapped unusually. With a damaged CRC, require all metadata
+    # signals and the standard 0x50-0x57 SPD address range.
+    if integrity_valid or (at_spd_address and revision_valid and module_type_valid and header_valid):
+        integrity = "valid checksum/CRC" if integrity_valid else "SPD header (checksum/CRC invalid)"
+        return f"{description}, {integrity}"
+    return ""
+
 def verify_region(eio: EepromIO, expected: bytes, page_size: int):
     """Read back the programmed region and compare it byte-for-byte."""
     actual = bytearray()
@@ -444,6 +523,8 @@ def main():
                         help='Max bytes per page write (device dependent)')
     parser.add_argument('--poll-write', action='store_true',
                         help='ACK-poll after each write page (more reliable for EEPROMs)')
+    parser.add_argument('--force-spd', action='store_true',
+                        help='Allow writing to an SPD-like EEPROM (DANGEROUS)')
     parser.add_argument('pairs', nargs='*', help='<key> <value> pairs for TLV fields')
 
     if hasattr(parser, "parse_intermixed_args"):
@@ -466,6 +547,15 @@ def main():
 
         if not args.pairs or (len(args.pairs) % 2) != 0:
             parser.error("Key/value pairs must be provided in <key> <value> format.")
+
+        if not args.binary and not args.force_spd:
+            spd_description = detect_spd(eio)
+            if spd_description:
+                error(
+                    f"Refusing to write: device 0x{args.eeprom_addr:02X} on I2C bus "
+                    f"{args.i2c_bus} looks like SPD ({spd_description}). Writing would "
+                    "damage the DIMM's SPD data. Use --force-spd only if this is intentional."
+                )
 
         if not args.yes:
             warning("This operation will overwrite TLV region in EEPROM (only TLV length bytes will be cleared/written).")
