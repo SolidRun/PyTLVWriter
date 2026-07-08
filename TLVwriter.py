@@ -338,26 +338,31 @@ def build_tlv(pairs) -> bytes:
 # -----------------------------
 # EEPROM ops (only TLV-length bytes)
 # -----------------------------
-def clear_region(eio: EepromIO, length: int, page_size: int, poll_write: bool):
-    offset = 0
-    while offset < length:
-        chunk_len = min(page_size, length - offset)
+def clear_region(eio: EepromIO, length: int, page_size: int, poll_write: bool,
+                 base_offset: int = 0):
+    written = 0
+    while written < length:
+        offset = base_offset + written
+        page_remaining = page_size - (offset % page_size)
+        chunk_len = min(page_remaining, length - written)
         blank = bytes([0x00] * chunk_len)
         eio.write(offset, blank)
         if poll_write:
             eio.eeprom_write_cycle_poll(offset)
-        offset += chunk_len
+        written += chunk_len
         time.sleep(0.01)
 
-def write_region(eio: EepromIO, blob: bytes, page_size: int, poll_write: bool):
-    offset = 0
-    total = len(blob)
-    while offset < total:
-        chunk = blob[offset:offset + page_size]
+def write_region(eio: EepromIO, blob: bytes, page_size: int, poll_write: bool,
+                 base_offset: int = 0):
+    written = 0
+    while written < len(blob):
+        offset = base_offset + written
+        page_remaining = page_size - (offset % page_size)
+        chunk = blob[written:written + page_remaining]
         eio.write(offset, chunk)
         if poll_write:
             eio.eeprom_write_cycle_poll(offset)
-        offset += len(chunk)
+        written += len(chunk)
         time.sleep(0.01)
 
 SPD_MEMORY_TYPES = {
@@ -439,13 +444,14 @@ def detect_spd(eio: EepromIO) -> str:
         return f"{description}, {integrity}"
     return ""
 
-def verify_region(eio: EepromIO, expected: bytes, page_size: int):
+def verify_region(eio: EepromIO, expected: bytes, page_size: int,
+                  base_offset: int = 0):
     """Read back the programmed region and compare it byte-for-byte."""
     actual = bytearray()
     offset = 0
     while offset < len(expected):
         n = min(page_size, len(expected) - offset)
-        actual.extend(eio.read(offset, n))
+        actual.extend(eio.read(base_offset + offset, n))
         offset += n
 
     actual = bytes(actual)
@@ -459,33 +465,37 @@ def verify_region(eio: EepromIO, expected: bytes, page_size: int):
                 f"EEPROM verification failed: read only {len(actual)} of "
                 f"{len(expected)} expected bytes"
             )
-        error(f"EEPROM verification failed at offset 0x{mismatch:04X}: "
+        absolute_offset = base_offset + mismatch
+        error(f"EEPROM verification failed at offset 0x{absolute_offset:04X}: "
               f"expected 0x{expected[mismatch]:02X}, read 0x{actual[mismatch]:02X}")
 
     success(f"EEPROM verification successful ({len(expected)} bytes matched).")
 
-def read_tlv_auto(eio: EepromIO, page_size: int) -> bytes:
+def read_tlv_auto(eio: EepromIO, page_size: int, base_offset: int = 0) -> bytes:
     """
     Read just enough bytes to parse the TLV:
       - read 11 bytes header
       - parse payload_len
       - read (11 + payload_len) bytes total
     """
-    hdr = bytes(eio.read(0, 11))
+    hdr = bytes(eio.read(base_offset, 11))
     if len(hdr) < 11:
         return hdr
 
     payload_len = struct.unpack('<H', hdr[9:11])[0]
     total = 11 + payload_len
 
-    if total > eio.max_bytes:
-        error(f"TLV claims total length {total}, exceeds max address space {eio.max_bytes}")
+    if base_offset + total > eio.max_bytes:
+        error(
+            f"TLV at offset 0x{base_offset:X} claims total length {total}, "
+            f"exceeding max address space {eio.max_bytes}"
+        )
 
     out = bytearray(hdr)
     offset = 11
     while offset < total:
         n = min(page_size, total - offset)
-        out.extend(eio.read(offset, n))
+        out.extend(eio.read(base_offset + offset, n))
         offset += n
     return bytes(out)
 
@@ -502,8 +512,6 @@ class CustomArgumentParser(argparse.ArgumentParser):
         return f"{base}\n{extra}"
 
 def main():
-    if os.geteuid() != 0:
-        error("Root privileges are required to modify EFI variables and access /dev/i2c-*.")
 
     parser = CustomArgumentParser(
         description="TLVwriter: Write TLV to EEPROM and CONFIG_CODE EFI variable (clears only TLV length bytes)."
@@ -521,6 +529,8 @@ def main():
                         help='EEPROM internal address width in bits (8 or 16)')
     parser.add_argument('--page-size', dest='page_size', type=int, default=DEFAULT_PAGE_SIZE,
                         help='Max bytes per page write (device dependent)')
+    parser.add_argument('-o', '--offset', type=lambda x: int(x, 0), default=0,
+                        help='EEPROM offset for TLV read/write (default: 0)')
     parser.add_argument('--poll-write', action='store_true',
                         help='ACK-poll after each write page (more reliable for EEPROMs)')
     parser.add_argument('--force-spd', action='store_true',
@@ -532,6 +542,14 @@ def main():
     else:
         args = parser.parse_args()
 
+    if args.offset < 0:
+        parser.error("--offset must be non-negative")
+    if args.page_size <= 0:
+        parser.error("--page-size must be greater than zero")
+
+    if os.geteuid() != 0:
+        error("Root privileges are required to modify EFI variables and access /dev/i2c-*.")
+
     eio = EepromIO(
         i2c_bus=args.i2c_bus,
         dev_addr=args.eeprom_addr,
@@ -541,7 +559,7 @@ def main():
 
     try:
         if args.read:
-            raw = read_tlv_auto(eio, args.page_size)
+            raw = read_tlv_auto(eio, args.page_size, args.offset)
             parse_and_display(raw)
             return
 
@@ -567,6 +585,12 @@ def main():
         if len(tlv_data) > eio.max_bytes:
             error(f"TLV blob length {len(tlv_data)} exceeds max {eio.max_bytes} for addr_width={args.addr_width}")
 
+        if not args.binary and args.offset + len(tlv_data) > eio.max_bytes:
+            error(
+                f"TLV at offset 0x{args.offset:X} ends at 0x{args.offset + len(tlv_data):X}, "
+                f"exceeding max {eio.max_bytes} for addr_width={args.addr_width}"
+            )
+
         if args.binary:
             path = "/tmp/eeprom_tlv.bin"
             with open(path, "wb") as f:
@@ -574,13 +598,17 @@ def main():
             info(f"TLV binary saved to {path}")
             return
 
-        clear_region(eio, len(tlv_data), args.page_size, args.poll_write)
-        write_region(eio, tlv_data, args.page_size, args.poll_write)
+        clear_region(eio, len(tlv_data), args.page_size, args.poll_write, args.offset)
+        write_region(eio, tlv_data, args.page_size, args.poll_write, args.offset)
 
-        success(f"TLV data written successfully ({len(tlv_data)} bytes). Max space for addr-width={args.addr_width} is {eio.max_bytes} bytes.\n")
+        success(
+            f"TLV data written successfully at offset 0x{args.offset:X} "
+            f"({len(tlv_data)} bytes). Max space for addr-width={args.addr_width} "
+            f"is {eio.max_bytes} bytes.\n"
+        )
 
         if args.verify:
-            verify_region(eio, tlv_data, args.page_size)
+            verify_region(eio, tlv_data, args.page_size, args.offset)
 
     finally:
         eio.close()

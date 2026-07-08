@@ -127,6 +127,7 @@ sudo python3 TLVwriter.py <i2c_bus> <eeprom_addr> [options] <key1> <val1> [<key2
 * `-y`, `--yes`     : Skip confirmation prompt before overwrite.
 * `-b`, `--binary`  : Write TLV blob to `/tmp/eeprom_tlv.bin` instead of EEPROM.
 * `-v`, `--verify`  : Read back the EEPROM after writing and verify it byte-for-byte.
+* `-o`, `--offset`  : Start reading/writing at this EEPROM offset (decimal or hex; default `0`).
 * `--force-spd`     : Override SPD protection and allow the write (**dangerous**).
 
 **Examples**:
@@ -150,4 +151,11 @@ sudo python3 TLVwriter.py <i2c_bus> <eeprom_addr> [options] <key1> <val1> [<key2
 
    ```bash
    sudo python3 TLVwriter.py 1 0x50 -b TLV_CODE_PLATFORM_NAME "ProtoSys" -y
+   ```
+
+4. **Write and verify at offset `0x10`** (preserving bytes `0x00`–`0x0F`):
+
+   ```bash
+   sudo python3 TLVwriter.py 1 0x50 --offset 0x10 --verify -y \
+     TLV_CODE_PLATFORM_NAME "ProtoSys"
    ```
