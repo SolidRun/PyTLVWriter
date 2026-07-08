@@ -360,6 +360,31 @@ def write_region(eio: EepromIO, blob: bytes, page_size: int, poll_write: bool):
         offset += len(chunk)
         time.sleep(0.01)
 
+def verify_region(eio: EepromIO, expected: bytes, page_size: int):
+    """Read back the programmed region and compare it byte-for-byte."""
+    actual = bytearray()
+    offset = 0
+    while offset < len(expected):
+        n = min(page_size, len(expected) - offset)
+        actual.extend(eio.read(offset, n))
+        offset += n
+
+    actual = bytes(actual)
+    if actual != expected:
+        mismatch = next((
+            i for i, (expected_byte, actual_byte) in enumerate(zip(expected, actual))
+            if expected_byte != actual_byte
+        ), min(len(expected), len(actual)))
+        if mismatch >= len(actual):
+            error(
+                f"EEPROM verification failed: read only {len(actual)} of "
+                f"{len(expected)} expected bytes"
+            )
+        error(f"EEPROM verification failed at offset 0x{mismatch:04X}: "
+              f"expected 0x{expected[mismatch]:02X}, read 0x{actual[mismatch]:02X}")
+
+    success(f"EEPROM verification successful ({len(expected)} bytes matched).")
+
 def read_tlv_auto(eio: EepromIO, page_size: int) -> bytes:
     """
     Read just enough bytes to parse the TLV:
@@ -410,6 +435,8 @@ def main():
     parser.add_argument('-r', '--read',   action='store_true', help='Read and display EEPROM TLV data (auto-length)')
     parser.add_argument('-y', '--yes',    action='store_true', help='Skip confirmation prompt')
     parser.add_argument('-b', '--binary', action='store_true', help='Save TLV binary to file only')
+    parser.add_argument('-v', '--verify', action='store_true',
+                        help='Read back and verify EEPROM contents after writing')
 
     parser.add_argument('--addr-width',   type=int, choices=[8, 16], default=8,
                         help='EEPROM internal address width in bits (8 or 16)')
@@ -461,6 +488,9 @@ def main():
         write_region(eio, tlv_data, args.page_size, args.poll_write)
 
         success(f"TLV data written successfully ({len(tlv_data)} bytes). Max space for addr-width={args.addr_width} is {eio.max_bytes} bytes.\n")
+
+        if args.verify:
+            verify_region(eio, tlv_data, args.page_size)
 
     finally:
         eio.close()

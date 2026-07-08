@@ -125,6 +125,7 @@ sudo python3 TLVwriter.py <i2c_bus> <eeprom_addr> [options] <key1> <val1> [<key2
 * `-r`, `--read`    : Read and display existing TLV data from EEPROM.
 * `-y`, `--yes`     : Skip confirmation prompt before overwrite.
 * `-b`, `--binary`  : Write TLV blob to `/tmp/eeprom_tlv.bin` instead of EEPROM.
+* `-v`, `--verify`  : Read back the EEPROM after writing and verify it byte-for-byte.
 
 **Examples**:
 
@@ -140,7 +141,7 @@ sudo python3 TLVwriter.py <i2c_bus> <eeprom_addr> [options] <key1> <val1> [<key2
    sudo python3 TLVwriter.py 1 0x50 \
      TLV_CODE_SYS_NAME "MyBoard" \
      TLV_CODE_SYS_UUID "123e4567-e89b-12d3-a456-426655440000" \
-     -y
+     -y --verify
    ```
 
 3. **Generate** binary only (no EEPROM write):
